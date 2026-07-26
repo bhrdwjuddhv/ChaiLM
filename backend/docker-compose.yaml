@@ -1,0 +1,25 @@
+# Pinned so the project name comes from here, not from the parent directory.
+# Without it Compose names the project "backend" and shares volumes with every
+# other project whose compose file also sits in a backend/ folder.
+name: chaillm
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
+  redis_data:
