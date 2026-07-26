@@ -6,6 +6,8 @@ import {
   EMBEDDING_DIM,
 } from './constants.js';
 
+// Local container or Qdrant Cloud is decided entirely by QDRANT_URL. The key is
+// omitted rather than sent empty, since a local instance rejects an empty header.
 export const qdrant = new QdrantClient({
   url: QDRANT_URL,
   apiKey: QDRANT_API_KEY || undefined,
