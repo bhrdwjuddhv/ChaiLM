@@ -16,6 +16,11 @@ export const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 export const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
 export const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 
+// Both optional. YouTube blocks datacenter IPs, so a deploy host often needs a
+// residential proxy for transcripts and/or the official API for playlist listing.
+export const YOUTUBE_PROXY_URL = process.env.YOUTUBE_PROXY_URL;
+export const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
+
 // OpenAI model ids — change here, nowhere else.
 export const EMBEDDING_MODEL = 'text-embedding-3-small';
 export const EMBEDDING_DIM = 1536;

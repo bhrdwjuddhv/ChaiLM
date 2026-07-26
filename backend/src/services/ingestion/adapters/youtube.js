@@ -1,9 +1,12 @@
-import { fetchVideoSegments, fetchVideoTitle } from '../../../utils/youtube.js';
+import { fetchVideoSegments, fetchVideoTitle, transportSummary } from '../../../utils/youtube.js';
 
 export async function extract(source) {
   const { videoId } = source.metadata;
+  console.log(`[youtube] ${videoId} starting — ${transportSummary()}`);
+
   const segments = await fetchVideoSegments(videoId);
   const title = await fetchVideoTitle(videoId).catch(() => null);
+  console.log(`[youtube] ${videoId} ok — ${segments.length} segments`);
 
   return {
     units: segments.map((s) => ({

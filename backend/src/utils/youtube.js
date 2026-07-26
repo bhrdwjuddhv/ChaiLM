@@ -1,4 +1,6 @@
 import { fetchTranscript } from 'youtube-transcript';
+import { ProxyAgent } from 'undici';
+import { YOUTUBE_PROXY_URL, YOUTUBE_API_KEY } from '../config/constants.js';
 
 const VIDEO_RE =
   /(?:youtube\.com\/(?:watch\?(?:[^#]*&)?v=|shorts\/|embed\/|live\/)|youtu\.be\/)([\w-]{11})/;
@@ -12,32 +14,136 @@ export const parsePlaylistId = (input = '') => input.match(PLAYLIST_RE)?.[1] || 
 export const findYoutubeLink = (text = '') =>
   (text.match(URL_RE) || []).find((url) => VIDEO_RE.test(url)) || null;
 
+// --- transport ---------------------------------------------------------------
+
+// YouTube throttles and blocks datacenter IPs, so the same code that works from a
+// laptop gets empty responses or 429s from a deploy host. A residential proxy is
+// what actually gets through; a datacenter one usually will not. Optional, so
+// local development is unchanged.
+const dispatcher = YOUTUBE_PROXY_URL ? new ProxyAgent(YOUTUBE_PROXY_URL) : undefined;
+
+export const usingProxy = Boolean(dispatcher);
+
+const BROWSERISH = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36',
+  'Accept-Language': 'en-US,en;q=0.9',
+};
+
+export const youtubeFetch = (url, init = {}) =>
+  fetch(url, {
+    ...init,
+    headers: { ...BROWSERISH, ...init.headers },
+    ...(dispatcher ? { dispatcher } : {}),
+  });
+
+// One line at startup of every playlist/video job so deploy logs say which path ran.
+export const transportSummary = () =>
+  `transport: ${usingProxy ? 'proxy (YOUTUBE_PROXY_URL)' : 'direct'}, ` +
+  `playlist listing: ${YOUTUBE_API_KEY ? 'YouTube Data API' : 'page scrape'}, ` +
+  `transcripts: youtube-transcript library (no external binary)`;
+
+// --- metadata ----------------------------------------------------------------
+
 export async function fetchVideoTitle(videoId) {
   // oEmbed needs no API key.
-  const res = await fetch(
+  const res = await youtubeFetch(
     `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`
   );
   if (!res.ok) return null;
   return (await res.json()).title ?? null;
 }
 
-// ponytail: scrapes the playlist page because no YOUTUBE_API_KEY exists in this
-// project's env. Breaks if YouTube changes its markup — upgrade path is the
-// YouTube Data API playlistItems endpoint.
-export async function fetchPlaylistVideoIds(playlistId) {
-  const res = await fetch(`https://www.youtube.com/playlist?list=${playlistId}`, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; chaiLLM/1.0)' },
-  });
-  if (!res.ok) throw new Error(`Could not fetch playlist (${res.status})`);
+// --- playlist listing --------------------------------------------------------
+
+// Official, paginated, and not IP-blocked the way the public playlist page is.
+async function listViaDataApi(playlistId) {
+  const ids = [];
+  let pageToken = '';
+  let title = null;
+
+  do {
+    const url =
+      `https://www.googleapis.com/youtube/v3/playlistItems?part=contentDetails,snippet` +
+      `&maxResults=50&playlistId=${encodeURIComponent(playlistId)}&key=${YOUTUBE_API_KEY}` +
+      (pageToken ? `&pageToken=${pageToken}` : '');
+
+    const res = await youtubeFetch(url);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const reason = body?.error?.message || `HTTP ${res.status}`;
+      throw new Error(`YouTube Data API rejected the playlist request: ${reason}`);
+    }
+
+    for (const item of body.items ?? []) {
+      const id = item.contentDetails?.videoId;
+      if (id) ids.push(id);
+    }
+    title ??= body.items?.[0]?.snippet?.channelTitle ?? null;
+    pageToken = body.nextPageToken ?? '';
+  } while (pageToken);
+
+  return { videoIds: ids, title };
+}
+
+const decodeEntities = (s = '') =>
+  s
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(n))
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+
+// ponytail: scraping the public playlist page needs no key but has two real
+// limits. It only sees the ~100 videos in the page's first payload (the rest are
+// lazy-loaded), and it is the part most likely to break on a deploy host, where
+// YouTube serves datacenter IPs a page with no videoIds at all. Set
+// YOUTUBE_API_KEY to use the official paginated listing instead.
+async function listViaScrape(playlistId) {
+  const res = await youtubeFetch(`https://www.youtube.com/playlist?list=${playlistId}`);
+  if (!res.ok) throw new Error(`Could not fetch playlist page (HTTP ${res.status})`);
   const html = await res.text();
 
-  const ids = [...html.matchAll(/"videoId":"([\w-]{11})"/g)].map((m) => m[1]);
-  const unique = [...new Set(ids)];
-  if (!unique.length) throw new Error('No videos found in this playlist (is it private?)');
+  const ids = [...new Set([...html.matchAll(/"videoId":"([\w-]{11})"/g)].map((m) => m[1]))];
+  const title = decodeEntities(
+    html.match(/<title>([^<]*)<\/title>/)?.[1]?.replace(/ - YouTube$/, '').trim() ?? ''
+  );
 
-  const title = html.match(/<title>([^<]*)<\/title>/)?.[1]?.replace(/ - YouTube$/, '').trim();
-  return { videoIds: unique, title };
+  if (!ids.length) {
+    const blocked = /consent\.youtube|captcha|unusual traffic|sign in to confirm/i.test(html);
+    throw new Error(
+      `Playlist page returned 0 videos (${html.length} bytes${blocked ? ', looks like a consent/captcha wall' : ''}). ` +
+        'This is the usual symptom of YouTube blocking a datacenter IP — set YOUTUBE_API_KEY ' +
+        'to list the playlist through the official API, or YOUTUBE_PROXY_URL to route around it.'
+    );
+  }
+  return { videoIds: ids, title };
 }
+
+export async function fetchPlaylistVideoIds(playlistId) {
+  const result = YOUTUBE_API_KEY ? await listViaDataApi(playlistId) : await listViaScrape(playlistId);
+
+  const scraped = !YOUTUBE_API_KEY;
+  console.log(
+    `[youtube] playlist ${playlistId}: found ${result.videoIds.length} videos ` +
+      `via ${scraped ? 'page scrape' : 'Data API'}`
+  );
+  // Exactly 100 from a scrape means the page's first payload was full and the
+  // rest were never loaded, not that the playlist is 100 long.
+  if (scraped && result.videoIds.length >= 100) {
+    console.warn(
+      `[youtube] playlist ${playlistId}: page scrape caps out around 100 videos — ` +
+        'set YOUTUBE_API_KEY to index the whole playlist.'
+    );
+  }
+  if (!result.videoIds.length) {
+    throw new Error('No videos found in this playlist (is it private or empty?)');
+  }
+  return result;
+}
+
+// --- transcripts -------------------------------------------------------------
 
 // youtube-transcript returns milliseconds from its srv3 parser and seconds from
 // its classic parser, with nothing in the response saying which ran.
@@ -66,7 +172,13 @@ function normalizeToSeconds(segments) {
 }
 
 export async function fetchVideoSegments(videoId) {
-  const segments = await fetchTranscript(videoId);
-  if (!segments?.length) throw new Error(`No transcript available for video ${videoId}`);
+  // The library takes a custom fetch, which is how the proxy reaches it.
+  const segments = await fetchTranscript(videoId, { fetch: youtubeFetch });
+  if (!segments?.length) {
+    throw new Error(
+      `Transcript for ${videoId} came back empty — usually captions are disabled, ` +
+        'or YouTube is serving this host a blank response (datacenter IP blocking).'
+    );
+  }
   return normalizeToSeconds(segments);
 }
