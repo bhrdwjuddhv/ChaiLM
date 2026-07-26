@@ -9,6 +9,3 @@ import { REDIS_URL } from './constants.js';
 export const redis = new IORedis(REDIS_URL, {
   maxRetriesPerRequest: null, // required by BullMQ
 });
-
-// Credentials live in the URL, so never log it raw.
-export const redactedRedisUrl = REDIS_URL.replace(/\/\/[^@]*@/, '//***@');
